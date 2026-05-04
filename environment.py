@@ -419,19 +419,19 @@ class WVRCombatEnv:
             return 0.0, True, 'draw_timeout'
 
         # === Eqs. 14-18: Non-terminal shaping reward ===
-        # Eq. 14: Distance reward (PAPER-FAITHFUL, see verified image)
-        # When d > d_ideal:  Rd = 1 - d/d_ideal  (negative when far, peaks at d=d_ideal)
-        # When d ≤ d_ideal:  Rd = e^(d/d_ideal - 1) - 1  (negative when close, peaks at d=d_ideal)
-        # Shape: peak at d=d_ideal=10km, penalty on both sides.
-        # Tactical: encourages engagement at IDEAL DISTANCE, penalizes both
-        # too-close (collision risk) and too-far (out of engagement).
-        # Previously had exponent flipped (1 - d/d_ideal) which incorrectly
-        # rewarded close range - this caused agent to dive into enemy rather
-        # than maintain crash induction separation. Verified against paper image.
+        # Eq. 14: Distance reward (paper-verified by rendering PDF page 7)
+        # When d > d_ideal:  Rd = 1 - d/d_ideal             (negative, decreases as d grows)
+        # When d ≤ d_ideal:  Rd = e^(-(d/d_ideal - 1)) - 1  (positive, peaks at d=0)
+        # Shape: monotonically decreases as d grows.
+        # At d=0: Rd ≈ +1.72 (max reward for being right on top of enemy).
+        # At d=d_ideal: Rd = 0.
+        # At d=2*d_ideal: Rd = -1.
+        # Matches paper text: "providing incentives based on how close they are"
+        # and "encouraging the enemy to follow us closely".
         if dist > self.D_IDEAL:
             Rd = 1.0 - dist / self.D_IDEAL
         else:
-            Rd = np.exp(dist / self.D_IDEAL - 1.0) - 1.0
+            Rd = np.exp(1.0 - dist / self.D_IDEAL) - 1.0
 
         # Eq. 15: Angle reward
         Ra = 1.0 - (np.degrees(ata) + np.degrees(aa)) / 360.0
@@ -440,22 +440,19 @@ class WVRCombatEnv:
         vd = self.red.v - self.blue.v
         Rv = vd / 700.0 if vd <= 0 else vd / 300.0
 
-        # Eq. 17: Boundary rewards (paper-faithful, no extension)
-        # Paper original: zero above warning altitude
+        # Eq. 17: Boundary rewards (paper-faithful)
         # Below warning: Rb_self = z/h_warning - 1 (negative, max -0.96 at 200m)
         # Below warning: Rb_enemy = h_warning/z - 1 (positive, +49 at 100m)
-        # Combined with hard altitude cap at 10km (out of bounds), there is
-        # no need for our gentle bridge extension - aircraft physically can't
-        # be above 10km, so paper's Rb=0 region is bounded.
+        # Above warning: both = 0 (paper's exact formulation)
         if self.red.z < self.H_WARNING:
             Rb_self = (self.red.z / self.H_WARNING - 1.0)
         else:
-            Rb_self = 0.0  # paper original
+            Rb_self = 0.0
 
         if self.blue.z < self.H_WARNING:
             Rb_enemy = (self.H_WARNING / max(self.blue.z, 1.0) - 1.0)
         else:
-            Rb_enemy = 0.0  # paper original
+            Rb_enemy = 0.0
 
         # Eq. 18: Adaptive weighting (paper)
         # Paper: d ≤ d_close uses 0.6 Rd + 0.3 Ra + 0.1 Rv + 0.5(Rb_self + Rb_enemy)
@@ -464,20 +461,6 @@ class WVRCombatEnv:
             R = 0.6 * Rd + 0.3 * Ra + 0.1 * Rv + 0.5 * (Rb_self + Rb_enemy)
         else:
             R = 0.7 * Ra + 0.2 * Rv + 0.5 * (Rb_self + Rb_enemy)
-
-        # Soft altitude penalty above 8km (replaces hard ceiling).
-        # Paper has no explicit altitude ceiling. Hard 10km termination caused
-        # 75-85% of episodes to end as zero-reward draws when aircraft drifted
-        # up — destroyed learning signal. This soft penalty creates gradient
-        # pulling agent toward operational envelope (6-8km) without killing
-        # episodes prematurely.
-        # Magnitude scales steeply above 12km to discourage extreme altitudes
-        # without hard termination. At 8km: 0. At 10km: -0.2. At 15km: -1.4.
-        # At 20km: -2.4. Quadratic above 8km.
-        SOFT_CEILING = 8000.0
-        if self.red.z > SOFT_CEILING:
-            altitude_excess = (self.red.z - SOFT_CEILING) / 1000.0  # km above 8km
-            R -= 0.05 * altitude_excess * altitude_excess  # quadratic penalty
 
         return R, False, 'ongoing'
 

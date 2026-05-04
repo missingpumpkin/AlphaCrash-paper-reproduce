@@ -93,7 +93,6 @@ def train(num_episodes=100000, seed=42, eval_every=5000, eval_games=500):
     else:
         print(f"Curriculum: Stage1<{env.CURRICULUM_STAGE_1_END} (low-alt engaged), Stage2<{env.CURRICULUM_STAGE_2_END} (mixed), Stage3+ (paper)")
     print(f"Dynamics: paper Eq. 1 gravity-coupled (n_z, μ via inner-loop controller, n_z clamped to [-3, +9]G per Table B1), {env.red.N_SUBSTEPS} substeps/decision")
-    print(f"Altitude: soft penalty above 8000m (replaces hard ceiling, hard cap removed)")
     print(f"WEZ: {env.WEZ_RANGE}m/{np.degrees(env.WEZ_ANGLE):.0f}deg/{env.HEALTH_DAMAGE_RATE}HP/s")
     print(f"Enemy: {env._n_enemy_actions} actions, gravity-coupled Eq. 1 prediction (1 decision step, 100 substeps, paper-specified)")
     print(f"Eval: {eval_games} games every {eval_every} episodes (epsilon=0)")
