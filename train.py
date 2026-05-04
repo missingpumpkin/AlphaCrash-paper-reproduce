@@ -7,11 +7,56 @@ checkpoint.
 """
 import os
 import time
+from collections import deque
 from datetime import timedelta
 import numpy as np
 import torch
 from environment import WVRCombatEnv
 from agent import QRDQNAgent
+
+
+# --- Undocumented patch #4: n-step returns ---
+# With gamma=0.9 and 1200-step episodes, terminal +/-1 decays to ~0 by 25
+# steps and is invisible at episode start. n-step returns propagate the
+# terminal reward back n steps per training update, which is essential for
+# learning the final crash-induction maneuver from the win signal.
+N_STEP = 10
+
+
+class NStepBuffer:
+    """Rolling window for computing n-step returns on-the-fly."""
+
+    def __init__(self, n, gamma):
+        self.n = n
+        self.gamma = gamma
+        self.queue = deque()
+
+    def push(self, transition):
+        """Push (s, a, r, s', done). Returns ready n-step transitions to be
+        forwarded to the PER buffer (zero or one per call)."""
+        self.queue.append(transition)
+        if len(self.queue) >= self.n:
+            ready = self._compute(self.n)
+            self.queue.popleft()
+            return [ready]
+        return []
+
+    def _compute(self, n_eff):
+        s_t, a_t = self.queue[0][0], self.queue[0][1]
+        R = 0.0
+        for k in range(n_eff):
+            R += (self.gamma ** k) * self.queue[k][2]
+        s_n = self.queue[n_eff - 1][3]
+        done_n = self.queue[n_eff - 1][4]
+        return (s_t, a_t, R, s_n, done_n, n_eff)
+
+    def flush(self):
+        """At episode end, drain remaining transitions as partial n-step."""
+        results = []
+        while self.queue:
+            results.append(self._compute(len(self.queue)))
+            self.queue.popleft()
+        return results
 
 
 def evaluate(agent, env, n_games=500):
@@ -58,9 +103,12 @@ def train(num_episodes=100000, seed=42, eval_every=5000, eval_games=500):
 
     print(f"Device: {device}")
     print(f"State: {env.state_dim}D | Actions: {env.action_dim} (9x9x9)")
-    print(f"Network: 3x64 | QR-DQN N=20 kappa={agent.kappa} | PER alpha=0.6 beta=0.4")
+    print(f"Network: 3x64 | QR-DQN N=20 kappa={agent.kappa} | PER alpha=0.6 beta=0.4 | n-step={N_STEP}")
     print(f"Exploration: per-step epsilon-greedy {agent.eps_start} -> {agent.eps_end} "
           f"over {agent.eps_decay_steps} env steps")
+    print(f"Undocumented patches: soft ceiling above {env.SOFT_CEILING:.0f}m "
+          f"(slope {env.CEILING_PENALTY}/km), reward scale x{env.REWARD_SCALE}, "
+          f"enemy 10x10ms substeps")
     print(f"Dynamics: paper Eq. 1 gravity-coupled, {env.red.N_SUBSTEPS} substeps/decision")
     print(f"WEZ: {env.WEZ_RANGE:.0f}m / {np.degrees(env.WEZ_ANGLE):.0f}deg / {env.HEALTH_DAMAGE_RATE} HP/s")
     print(f"Enemy: {env._n_enemy_actions} actions, gravity-coupled 1-step prediction")
@@ -80,17 +128,21 @@ def train(num_episodes=100000, seed=42, eval_every=5000, eval_games=500):
 
     for ep in range(1, num_episodes + 1):
         state = env.reset()
+        n_buf = NStepBuffer(n=N_STEP, gamma=agent.gamma)
 
         while True:
             mask = env.get_action_mask()
             action = agent.select_action(state, action_mask=mask)
             next_state, reward, done, info = env.step(action)
-            agent.store(state, action, reward, next_state, float(done))
+            for tr in n_buf.push((state, action, reward, next_state, float(done))):
+                agent.store(*tr)
             loss = agent.train_step()
             if loss > 0:
                 losses.append(loss)
             state = next_state
             if done:
+                for tr in n_buf.flush():
+                    agent.store(*tr)
                 break
 
         results.append(info)

@@ -78,8 +78,9 @@ class PrioritizedReplayBuffer:
         self.eps = eps
         self.max_priority = 1.0
 
-    def push(self, state, action, reward, next_state, done):
-        self.tree.add(self.max_priority, (state, action, reward, next_state, done))
+    def push(self, transition):
+        """transition is a tuple (state, action, reward, next_state, done, n_eff)."""
+        self.tree.add(self.max_priority, transition)
 
     def sample(self, batch_size):
         batch, indices, priorities = [], [], []
@@ -216,8 +217,18 @@ class QRDQNAgent:
                 q = q.masked_fill(mask_t.unsqueeze(0) == 0, float('-inf'))
             return q.argmax(1).item()
 
-    def store(self, state, action, reward, next_state, done):
-        self.buffer.push(state, action, reward, next_state, float(done))
+    def store(self, state, action, reward, next_state, done, n_eff=1):
+        """Store an n-step transition.
+
+        n_eff=1 is plain 1-step. For n-step returns:
+            reward = sum_{k=0}^{n_eff-1} gamma^k * r_{t+k}
+            next_state = s_{t+n_eff}  (or terminal state)
+            done = whether terminal hit within the n-step window
+            n_eff = effective n (less than n at episode tails)
+        train_step uses gamma^n_eff for bootstrap, so terminal +/-1 reaches
+        states up to n_eff steps earlier in the trajectory.
+        """
+        self.buffer.push((state, action, reward, next_state, float(done), int(n_eff)))
 
     def train_step(self):
         """Sample from PER, compute QR loss, update policy + soft target."""
@@ -229,24 +240,26 @@ class QRDQNAgent:
             return 0.0
         weights = weights.to(self.device)
 
-        states, actions, rewards, next_states, dones = zip(*batch)
+        states, actions, rewards, next_states, dones, n_effs = zip(*batch)
         s = torch.FloatTensor(np.array(states)).to(self.device)
         a = torch.LongTensor(actions).to(self.device)
         r = torch.FloatTensor(rewards).to(self.device)
         s2 = torch.FloatTensor(np.array(next_states)).to(self.device)
         d = torch.FloatTensor(dones).to(self.device)
+        gamma_n = torch.FloatTensor([self.gamma ** n for n in n_effs]).to(self.device)
         B = len(batch)
 
         # Current quantiles for chosen actions: (B, N)
         cur_q = self.policy_net(s)[torch.arange(B), a]
 
         with torch.no_grad():
-            # Standard QR-DQN (Dabney 2018):
-            #   Algorithm 1 line 13: a* = argmax_a mean_i Q(s', a; theta)[tau_i]
-            #   per-quantile target:  y[i] = r + gamma * Q_target(s', a*; theta')[tau_i]
+            # Standard QR-DQN per-quantile target (Dabney 2018) with n-step:
+            #   a* = argmax_a mean_i Q(s', a; theta)[tau_i]   (s' = s_{t+n_eff})
+            #   y[i] = R_n + gamma^n_eff * Q_target(s', a*)[tau_i]
+            # where R_n = sum_k gamma^k r_{t+k} is the n-step return.
             next_a = self.policy_net.q_values(s2).argmax(1)
             next_q = self.target_net(s2)[torch.arange(B), next_a]  # (B, N)
-            target = r.unsqueeze(1) + self.gamma * (1 - d.unsqueeze(1)) * next_q  # (B, N)
+            target = r.unsqueeze(1) + gamma_n.unsqueeze(1) * (1 - d.unsqueeze(1)) * next_q  # (B, N)
 
         # Pairwise quantile-Huber loss (Eqs. 8-9):
         #   td[b, i, j] = target[b, i] - cur_q[b, j]

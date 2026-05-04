@@ -53,6 +53,12 @@ class WVRCombatEnv:
     # terminated as draws to avoid corrupting the replay buffer.
     MAX_POSITION_RANGE = 50000.0
 
+    # --- Undocumented patches (paper-faithful reward function alone is
+    # insufficient to learn the lure-down strategy; see notes in _evaluate) ---
+    SOFT_CEILING = 10000.0    # paper's max init altitude; penalize drift above
+    CEILING_PENALTY = 0.02    # quadratic in km of excess
+    REWARD_SCALE = 0.1        # divide all step rewards to bound Rb_enemy spikes
+
     def __init__(self):
         self.red = Aircraft()
         self.blue = Aircraft()
@@ -202,6 +208,9 @@ class WVRCombatEnv:
         aa = np.arccos(np.clip(np.dot(bw, delta) / (np.linalg.norm(bw) * dist), -1, 1))
 
         # === Eq. 13: Terminal conditions ===
+        # Terminal rewards stay at +/-1 (NOT scaled by REWARD_SCALE) so the
+        # win signal stays large relative to per-step shaping. n-step returns
+        # in train.py propagate this back through the trajectory.
         if dist < self.COLLISION_DIST:
             return 0.0, True, 'draw_collision'
 
@@ -261,6 +270,27 @@ class WVRCombatEnv:
         else:
             R = 0.7 * Ra + 0.2 * Rv + 0.5 * (Rb_self + Rb_enemy)
 
+        # --- Undocumented patch #1: soft altitude ceiling ---
+        # Paper's reward function has no upper-altitude penalty: above 5km
+        # both Rb terms are zero (Eq. 17), so the agent has no incentive to
+        # descend. Empirically the agent learns to drift to 30-45km and stay
+        # there, never engaging. A *quadratic* penalty above 10km (paper's
+        # max init altitude) breaks this attractor without distorting the
+        # in-distribution reward landscape (after REWARD_SCALE x0.1):
+        #   z=11km -> -0.002     (negligible, allows brief excursions)
+        #   z=15km -> -0.05      (mild)
+        #   z=20km -> -0.20      (notable)
+        #   z=30km -> -0.80      (dominates per-step shaping)
+        if self.red.z > self.SOFT_CEILING:
+            excess_km = (self.red.z - self.SOFT_CEILING) / 1000.0
+            R -= self.CEILING_PENALTY * excess_km * excess_km
+
+        # --- Undocumented patch #2: reward scaling ---
+        # Rb_enemy can spike to +49 at h=100m (Eq. 17 has a 1/h singularity)
+        # while typical step rewards are O(1). Scaling /10 keeps the value
+        # distribution within a range QR-DQN can fit with 20 quantiles.
+        R *= self.REWARD_SCALE
+
         return R, False, 'ongoing'
 
     def _enemy_policy(self):
@@ -287,7 +317,12 @@ class WVRCombatEnv:
         dy = np.clip(self._e_yaw, -Aircraft.MAX_YAW_RATE, Aircraft.MAX_YAW_RATE)
         dp = np.clip(self._e_pitch, -Aircraft.MAX_PITCH_RATE, Aircraft.MAX_PITCH_RATE)
 
-        N_PRED_SUBSTEPS = Aircraft.N_SUBSTEPS  # 100
+        # --- Undocumented patch #3: speed up enemy policy ---
+        # The actual aircraft uses 100 x 1ms substeps for high-G dynamics
+        # stability. The enemy's forward prediction over a single 100ms
+        # decision step doesn't need that resolution; 10 x 10ms is plenty
+        # accurate and ~10x faster (this is the wall-clock bottleneck).
+        N_PRED_SUBSTEPS = 10
         h = self.DT / N_PRED_SUBSTEPS
 
         for _ in range(N_PRED_SUBSTEPS):
