@@ -1,51 +1,37 @@
 """
-Aircraft dynamics — Paper Eq. 1: 3D gravity-coupled coordinated turn model.
+Aircraft dynamics -- Paper Eq. 1: 3D gravity-coupled coordinated turn model.
 
-Paper Eq. 1 (verified from paper image):
-    ẋ = v cos η sin ψ
-    ẏ = v cos η cos ψ
-    ż = v sin η
-    η̇ = (g/v)(n_z cos μ - cos η)         <-- gravity-coupled flight path
-    ψ̇ = (g n_z sin μ) / (v cos η)         <-- gravity-coupled heading
+    x_dot = v cos eta sin psi
+    y_dot = v cos eta cos psi
+    z_dot = v sin eta
+    eta_dot = (g/v)(n_z cos mu - cos eta)
+    psi_dot = g n_z sin mu / (v cos eta)
 
-Where:
-    η = flight path angle (pitch, "track angle")
-    ψ = heading angle (yaw)
-    μ = bank angle (roll)
-    n_z = normal load factor (G-force)
+with eta = flight path angle (pitch), psi = heading angle (yaw),
+mu = bank angle (roll), n_z = normal load factor (G).
 
-Action space (Section 3.6): commanded yaw_rate, pitch_rate, accel
-    Inner-loop controller: Convert (desired_pitch_rate, desired_yaw_rate)
-    to required (n_z, μ) via Eq. 1 inversion.
-    Clamp n_z to [NZ_MIN, NZ_MAX] = [-3, 9] (Table B1).
-    Apply Eq. 1 with clamped n_z to get ACTUAL η̇, ψ̇.
+Action space (Section 3.6) is commanded (yaw_rate, pitch_rate, accel).
+Inner-loop controller inverts Eq. 1 to get the (n_z, mu) that would
+produce those rates, clamps n_z to Table B1's [-3, +9] G envelope, then
+re-applies Eq. 1 with the clamped n_z. When n_z saturates, both rates
+shrink proportionally -- this is the gravity coupling that makes high-G
+turns lose energy/altitude (paper's crash-induction physics).
 
-Why gravity-coupled (paper Eq. 1) over direct-rate Dubins:
-    1. Eq. 1 explicitly shows gravity coupling (-cos η term)
-    2. n_z and μ are the actual control variables in Eq. 1
-    3. Crash induction physics REQUIRES gravity coupling:
-       - Hard turns deplete G-budget
-       - Aircraft sinks naturally during high-G maneuvers
-       - At low altitude, can't recover -> crash
-    4. Table B1's G-limits (9G/-3G) are MEANINGFUL in this model
-    5. Paper's described "spiral descent" requires energy loss in turns
-
-Integration: 100 substeps × 1ms = 100ms decision step (Table B1).
+Integration: Table B1's 100 substeps x 1 ms = 100 ms decision step.
 """
 import numpy as np
 
 
 class Aircraft:
     G = 9.81
-    NZ_MAX = 9.0   # Max normal load factor (positive = pull-up)
-    NZ_MIN = -3.0  # Min normal load factor (negative = push-over)
+    NZ_MAX = 9.0   # Table B1: maximum overload
+    NZ_MIN = -3.0  # Table B1: minimum overload
     V_MAX = 800.0
     V_MIN = 100.0
-    MAX_YAW_RATE = np.radians(30)    # 30°/s commanded
-    MAX_PITCH_RATE = np.radians(60)  # 60°/s commanded
+    MAX_YAW_RATE = np.radians(30)    # Table B1: max sideslip angular velocity
+    MAX_PITCH_RATE = np.radians(60)  # Table B1: max pitch angular velocity
     CRASH_ALT = 100.0
-    CEILING_ALT = 10000.0  # Hard altitude cap (paper's operational ceiling)
-    N_SUBSTEPS = 100  # 1ms substeps per 100ms decision (Table B1)
+    N_SUBSTEPS = 100  # Table B1: 1 ms substep x 100 = 100 ms decision step
 
     def __init__(self):
         self.x = 0.0
@@ -57,7 +43,6 @@ class Aircraft:
         self.mu = 0.0
         self.health = 100.0
         self.crashed = False
-        self.out_of_bounds = False  # True if aircraft exceeded 10km ceiling
         self.acc = 0.0
         self.yaw_rate = 0.0
         self.pitch_rate = 0.0
@@ -68,17 +53,15 @@ class Aircraft:
         self.mu = 0.0
         self.health = 100.0
         self.crashed = False
-        self.out_of_bounds = False
         self.acc = self.yaw_rate = self.pitch_rate = 0.0
 
     def step(self, acc, desired_yaw_rate, desired_pitch_rate, dt=0.1):
-        """
-        Advance state by dt seconds using paper Eq. 1 gravity-coupled dynamics.
+        """Advance state by dt seconds using paper Eq. 1.
 
-        Inner-loop: invert Eq. 1 to get required (n_z, μ), clamp n_z, then
-        apply Eq. 1 forward with clamped n_z. Saturated G produces less rate
-        than commanded, generating altitude/energy loss for unsustainable
-        maneuvers (paper's crash induction physics).
+        Inner-loop controller inverts Eq. 1 to find (n_z, mu) for the
+        commanded rates, clamps n_z to [-3, +9] G, and re-applies Eq. 1
+        with the clamped value. Saturation produces less rate than commanded,
+        leaking energy/altitude on unsustainable maneuvers.
         """
         desired_yaw = np.clip(desired_yaw_rate, -self.MAX_YAW_RATE, self.MAX_YAW_RATE)
         desired_pitch = np.clip(desired_pitch_rate, -self.MAX_PITCH_RATE, self.MAX_PITCH_RATE)
@@ -92,38 +75,23 @@ class Aircraft:
         for _ in range(self.N_SUBSTEPS):
             cos_eta = np.cos(self.eta)
 
-            # Inner-loop controller: invert Eq. 1 to find (n_z, μ) for commanded rates.
-            # From Eq. 1:
-            #   η̇ = (g/v)(n_z cos μ - cos η)  =>  n_z cos μ = (v η̇/g) + cos η  ≡ A
-            #   ψ̇ = g n_z sin μ / (v cos η)   =>  n_z sin μ = v cos η ψ̇ / g     ≡ B
-            # Therefore:
-            #   n_z = sign(A) * √(A² + B²)
-            #   μ = arctan2(B, |A|)
-            #
-            # When n_z saturates (|n_z| > 9 or n_z < -3), we keep μ as computed
-            # but use clamped n_z. This means BOTH rates reduce proportionally
-            # when G-budget is exhausted - consistent with coordinated maneuver
-            # physics. The pilot's stick choice "mixes" pitch and turn; when
-            # saturated, the mix is preserved but magnitudes reduced.
-            #
-            # This produces sensible behavior:
-            #   - Pure pitch command: μ=0, n_z varies with command
-            #   - Pure yaw command: μ depends on yaw magnitude, n_z increases
-            #     to support coordinated turn (saturates if turn too aggressive)
-            #   - Combined: G-budget split between pitch and turn
-
+            # Invert Eq. 1 for required (n_z, mu):
+            #   eta_dot = (g/v)(n_z cos mu - cos eta)
+            #     => n_z cos mu = (v eta_dot/g) + cos eta  =: A
+            #   psi_dot = g n_z sin mu / (v cos eta)
+            #     => n_z sin mu = v cos eta psi_dot / g    =: B
+            #   n_z = sign(A) * sqrt(A^2 + B^2),  mu = atan2(B, |A|)
             A = self.v * desired_pitch / self.G + cos_eta
             B = self.v * cos_eta * desired_yaw / self.G if abs(cos_eta) > 1e-8 else 0.0
 
             nz_magnitude = np.sqrt(A * A + B * B)
-            # Sign of n_z determined by sign of A (cos μ direction)
             nz_required = -nz_magnitude if A < 0 else nz_magnitude
             mu = np.arctan2(B, abs(A))
 
-            # Clamp n_z to physical limits (Table B1: [-3, +9] G)
+            # Clamp n_z to physical envelope (Table B1)
             nz = np.clip(nz_required, self.NZ_MIN, self.NZ_MAX)
 
-            # Apply Eq. 1 forward with CLAMPED n_z (μ unchanged)
+            # Re-apply Eq. 1 forward with clamped n_z
             actual_eta_dot = (self.G / self.v) * (nz * np.cos(mu) - cos_eta)
             if abs(cos_eta) > 1e-8:
                 actual_psi_dot = self.G * nz * np.sin(mu) / (self.v * cos_eta)
@@ -141,7 +109,7 @@ class Aircraft:
             self.psi += actual_psi_dot * h
             last_mu = mu
 
-            # Intra-substep crash detection (ground)
+            # Intra-substep crash detection
             if self.z < self.CRASH_ALT:
                 self.crashed = True
                 self.z = max(self.z, 0.0)
@@ -153,17 +121,10 @@ class Aircraft:
                 self.psi = (self.psi + np.pi) % (2 * np.pi) - np.pi
                 return
 
-            # Hard altitude ceiling DISABLED — replaced with soft penalty in
-            # environment._evaluate() above 8km. Hard ceiling was causing
-            # 75-85% of episodes to terminate as zero-reward draws, destroying
-            # learning signal for crash induction strategy.
-
-        # Store actual rates for state observation (Table 1)
         self.pitch_rate = actual_eta_dot
         self.yaw_rate = actual_psi_dot
         self.mu = last_mu
 
-        # State limits
         self.v = np.clip(self.v, self.V_MIN, self.V_MAX)
         self.eta = np.clip(self.eta, -np.pi / 2, np.pi / 2)
         self.psi = (self.psi + np.pi) % (2 * np.pi) - np.pi
@@ -171,7 +132,6 @@ class Aircraft:
         if self.z < self.CRASH_ALT:
             self.crashed = True
             self.z = max(self.z, 0.0)
-        # Hard ceiling disabled — soft penalty in environment._evaluate handles altitude
 
     def pos(self):
         return np.array([self.x, self.y, self.z])
@@ -181,5 +141,5 @@ class Aircraft:
         return np.array([
             np.cos(self.eta) * np.sin(self.psi),
             np.cos(self.eta) * np.cos(self.psi),
-            np.sin(self.eta)
+            np.sin(self.eta),
         ])
