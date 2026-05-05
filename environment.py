@@ -49,15 +49,18 @@ class WVRCombatEnv:
     MAX_TIME = 120.0
     DT = 0.1
 
-    # Engineering safety: episodes ending in NaN or extreme positions are
-    # terminated as draws to avoid corrupting the replay buffer.
-    MAX_POSITION_RANGE = 50000.0
+    # --- Constrained-RL formulation (undocumented in paper) ---
+    # Crash induction is fundamentally an offensive task: disengagement is
+    # mission failure, not a neutral outcome. Combined with the hard service
+    # ceiling enforced in Aircraft.step (z<=10km, eta clamped to <=0 there),
+    # this confines exploration to a combat-relevant volume that's ~10x
+    # smaller than unbounded space, giving 10x denser sample coverage.
+    DISENGAGE_DIST = 50000.0          # >50km apart -> -1 (lose_disengaged)
+    NO_ENGAGE_HEALTH = 99.0           # both >99 HP at timeout -> -1
+    REWARD_SCALE = 0.1                # bound per-step rewards (Rb_enemy 1/h spike)
 
-    # --- Undocumented patches (paper-faithful reward function alone is
-    # insufficient to learn the lure-down strategy; see notes in _evaluate) ---
-    SOFT_CEILING = 10000.0    # paper's max init altitude; penalize drift above
-    CEILING_PENALTY = 0.02    # quadratic in km of excess
-    REWARD_SCALE = 0.1        # divide all step rewards to bound Rb_enemy spikes
+    # Engineering safety: NaN guard and absolute-position blow-up
+    MAX_POSITION_RANGE = 200000.0     # 200km from origin (numerical only)
 
     def __init__(self):
         self.red = Aircraft()
@@ -207,10 +210,17 @@ class WVRCombatEnv:
         # AA: blue's heading to direction red->blue (0 = red on blue's 6 o'clock)
         aa = np.arccos(np.clip(np.dot(bw, delta) / (np.linalg.norm(bw) * dist), -1, 1))
 
-        # === Eq. 13: Terminal conditions ===
+        # === Eq. 13 (extended) -- terminal conditions ===
         # Terminal rewards stay at +/-1 (NOT scaled by REWARD_SCALE) so the
         # win signal stays large relative to per-step shaping. n-step returns
-        # in train.py propagate this back through the trajectory.
+        # in train.py propagate the terminal back through the trajectory.
+
+        # Constrained-RL: disengagement is mission failure (not a draw).
+        # If aircraft drifted >50km apart, the agent has failed at the
+        # offensive task regardless of who "caused" it.
+        if dist > self.DISENGAGE_DIST:
+            return -1.0, True, 'lose_disengaged'
+
         if dist < self.COLLISION_DIST:
             return 0.0, True, 'draw_collision'
 
@@ -222,6 +232,7 @@ class WVRCombatEnv:
         if rc and not bc:
             return -1.0, True, 'lose_crash'
 
+        # Legitimate combat draw (mutual destruction) preserved
         if self.blue.health <= 0 and self.red.health <= 0:
             return 0.0, True, 'draw_blood'
         if self.blue.health <= 0:
@@ -230,6 +241,10 @@ class WVRCombatEnv:
             return -1.0, True, 'lose_blood'
 
         if self.t >= self.MAX_TIME:
+            # Constrained-RL: if both aircraft survived ~unscathed, there
+            # was no real engagement -> mission failure
+            if self.red.health > self.NO_ENGAGE_HEALTH and self.blue.health > self.NO_ENGAGE_HEALTH:
+                return -1.0, True, 'lose_timeout_no_engagement'
             if self.red.health > self.blue.health:
                 return 1.0, True, 'win_timeout'
             elif self.red.health < self.blue.health:
@@ -270,25 +285,10 @@ class WVRCombatEnv:
         else:
             R = 0.7 * Ra + 0.2 * Rv + 0.5 * (Rb_self + Rb_enemy)
 
-        # --- Undocumented patch #1: soft altitude ceiling ---
-        # Paper's reward function has no upper-altitude penalty: above 5km
-        # both Rb terms are zero (Eq. 17), so the agent has no incentive to
-        # descend. Empirically the agent learns to drift to 30-45km and stay
-        # there, never engaging. A *quadratic* penalty above 10km (paper's
-        # max init altitude) breaks this attractor without distorting the
-        # in-distribution reward landscape (after REWARD_SCALE x0.1):
-        #   z=11km -> -0.002     (negligible, allows brief excursions)
-        #   z=15km -> -0.05      (mild)
-        #   z=20km -> -0.20      (notable)
-        #   z=30km -> -0.80      (dominates per-step shaping)
-        if self.red.z > self.SOFT_CEILING:
-            excess_km = (self.red.z - self.SOFT_CEILING) / 1000.0
-            R -= self.CEILING_PENALTY * excess_km * excess_km
-
-        # --- Undocumented patch #2: reward scaling ---
-        # Rb_enemy can spike to +49 at h=100m (Eq. 17 has a 1/h singularity)
-        # while typical step rewards are O(1). Scaling /10 keeps the value
-        # distribution within a range QR-DQN can fit with 20 quantiles.
+        # Reward scaling: Rb_enemy can spike to +49 at h=100m (Eq. 17 has a
+        # 1/h singularity). With typical step rewards O(1), QR-DQN's 20
+        # quantiles can't span that range cleanly. Scaling brings step
+        # rewards into ~[-1, +1]. Terminal +/-1 rewards are NOT scaled.
         R *= self.REWARD_SCALE
 
         return R, False, 'ongoing'
@@ -346,6 +346,12 @@ class WVRCombatEnv:
             pv = np.clip(pv + self._e_acc * h, Aircraft.V_MIN, Aircraft.V_MAX)
             pe = np.clip(pe + actual_eta_dot * h, -np.pi / 2, np.pi / 2)
             pp += actual_psi_dot * h
+
+            # Constrained-RL: hard ceiling (matches Aircraft.step exactly so
+            # the predicted next state is what blue will actually experience)
+            at_ceiling = pz >= Aircraft.CEILING_ALT
+            pz = np.where(at_ceiling, Aircraft.CEILING_ALT, pz)
+            pe = np.where(at_ceiling & (pe > 0), 0.0, pe)
 
         ce_final = np.cos(pe)
         bw = np.column_stack([ce_final * np.sin(pp),

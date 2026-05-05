@@ -106,8 +106,10 @@ def train(num_episodes=100000, seed=42, eval_every=5000, eval_games=500):
     print(f"Network: 3x64 | QR-DQN N=20 kappa={agent.kappa} | PER alpha=0.6 beta=0.4 | n-step={N_STEP}")
     print(f"Exploration: per-step epsilon-greedy {agent.eps_start} -> {agent.eps_end} "
           f"over {agent.eps_decay_steps} env steps")
-    print(f"Undocumented patches: soft ceiling above {env.SOFT_CEILING:.0f}m "
-          f"(slope {env.CEILING_PENALTY}/km), reward scale x{env.REWARD_SCALE}, "
+    print(f"Constrained-RL: hard ceiling at {env.red.CEILING_ALT:.0f}m, "
+          f"disengage>{env.DISENGAGE_DIST:.0f}m -> -1, "
+          f"timeout w/both>{env.NO_ENGAGE_HEALTH:.0f}HP -> -1")
+    print(f"Undocumented patches: reward scale x{env.REWARD_SCALE}, "
           f"enemy 10x10ms substeps")
     print(f"Dynamics: paper Eq. 1 gravity-coupled, {env.red.N_SUBSTEPS} substeps/decision")
     print(f"WEZ: {env.WEZ_RANGE:.0f}m / {np.degrees(env.WEZ_ANGLE):.0f}deg / {env.HEALTH_DAMAGE_RATE} HP/s")

@@ -31,6 +31,7 @@ class Aircraft:
     MAX_YAW_RATE = np.radians(30)    # Table B1: max sideslip angular velocity
     MAX_PITCH_RATE = np.radians(60)  # Table B1: max pitch angular velocity
     CRASH_ALT = 100.0
+    CEILING_ALT = 10000.0  # Constrained-RL: hard service ceiling (paper's max init altitude)
     N_SUBSTEPS = 100  # Table B1: 1 ms substep x 100 = 100 ms decision step
 
     def __init__(self):
@@ -109,7 +110,17 @@ class Aircraft:
             self.psi += actual_psi_dot * h
             last_mu = mu
 
-            # Intra-substep crash detection
+            # Constrained-RL: hard service ceiling.
+            # When z >= 10km, clamp z and force eta <= 0 so the aircraft
+            # cannot continue climbing. The pitch_rate state observation
+            # still reflects the commanded rate, so the agent can see that
+            # its climb command had no effect (useful learning signal).
+            if self.z >= self.CEILING_ALT:
+                self.z = self.CEILING_ALT
+                if self.eta > 0:
+                    self.eta = 0.0
+
+            # Intra-substep crash detection (ground)
             if self.z < self.CRASH_ALT:
                 self.crashed = True
                 self.z = max(self.z, 0.0)
@@ -128,6 +139,13 @@ class Aircraft:
         self.v = np.clip(self.v, self.V_MIN, self.V_MAX)
         self.eta = np.clip(self.eta, -np.pi / 2, np.pi / 2)
         self.psi = (self.psi + np.pi) % (2 * np.pi) - np.pi
+
+        # Constrained-RL: also enforce ceiling at end-of-step (in case the
+        # final substep landed exactly at z = CEILING_ALT with eta > 0)
+        if self.z >= self.CEILING_ALT:
+            self.z = self.CEILING_ALT
+            if self.eta > 0:
+                self.eta = 0.0
 
         if self.z < self.CRASH_ALT:
             self.crashed = True
