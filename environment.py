@@ -59,6 +59,16 @@ class WVRCombatEnv:
     NO_ENGAGE_HEALTH = 99.0           # both >99 HP at timeout -> -1
     REWARD_SCALE = 0.1                # bound per-step rewards (Rb_enemy 1/h spike)
 
+    # --- Curriculum (also undocumented in paper) ---
+    # Random initial conditions per Section 4.1.1 are too hard to bootstrap:
+    # at 7-10km starting altitude with full heading randomization, crash
+    # induction never happens by chance. Stage 1 starts at low altitude and
+    # close range with blue heading toward red, so the lure-down maneuver is
+    # short and frequent (random play yields 5-10% wins). Stage 2 mixes 50/50
+    # easy and paper conditions. Stage 3 is paper-faithful.
+    CURRICULUM_STAGE_1_END = 3000
+    CURRICULUM_STAGE_2_END = 8000
+
     # Engineering safety: NaN guard and absolute-position blow-up
     MAX_POSITION_RANGE = 200000.0     # 200km from origin (numerical only)
 
@@ -79,24 +89,47 @@ class WVRCombatEnv:
         self.action_dim = N_ACTIONS
 
     def reset(self, episode=None):
-        """Section 4.1.1: uniform-random initial conditions.
+        """Initial conditions per current curriculum stage.
 
-        episode is accepted but ignored (no curriculum) -- kept for API
-        compatibility with training loops that pass it.
+        episode=None or >= STAGE_2_END uses paper distribution (Section 4.1.1).
+        Otherwise stage 1 (close, low alt, blue chasing) or stage 2 (50/50 mix)
+        based on the episode number.
         """
-        del episode
         self.t = 0.0
+        stage = self._curriculum_stage(episode)
+        self.curriculum_stage = stage  # exposed for logging
 
-        dist = np.random.uniform(500, 10000)
-        r_alt = np.random.uniform(7000, 10000)
-        b_alt = np.random.uniform(7000, 10000)
-        r_heading = np.random.uniform(0, 2 * np.pi)
-        b_heading = np.random.uniform(0, 2 * np.pi)
+        if stage == 1 or (stage == 2 and np.random.random() < 0.5):
+            # Easy: close range, low altitude, blue heading toward red.
+            # Aircraft heading convention (see aircraft.heading()): psi=0 means
+            # +Y (North); heading_x = sin(psi), heading_y = cos(psi). For blue
+            # at (bx, by) to face origin, direction is (-bx, -by) and the
+            # required psi = atan2(-bx, -by) = atan2(-cos(angle), -sin(angle)).
+            dist = np.random.uniform(500, 1500)
+            r_alt = np.random.uniform(1500, 3000)
+            b_alt = np.random.uniform(r_alt + 200, r_alt + 1500)
+            r_heading = np.random.uniform(0, 2 * np.pi)
+            angle = np.random.uniform(0, 2 * np.pi)
+            b_heading = np.arctan2(-np.cos(angle), -np.sin(angle)) + np.random.uniform(-np.pi/6, np.pi/6)
+        else:
+            # Paper distribution (stage 3 or stage 2 paper-side of mix)
+            dist = np.random.uniform(500, 10000)
+            r_alt = np.random.uniform(7000, 10000)
+            b_alt = np.random.uniform(7000, 10000)
+            r_heading = np.random.uniform(0, 2 * np.pi)
+            b_heading = np.random.uniform(0, 2 * np.pi)
+            angle = np.random.uniform(0, 2 * np.pi)
 
-        angle = np.random.uniform(0, 2 * np.pi)
         self.red.reset(0, 0, r_alt, 300, 0, r_heading)
         self.blue.reset(dist * np.cos(angle), dist * np.sin(angle), b_alt, 300, 0, b_heading)
         return self._get_state()
+
+    def _curriculum_stage(self, episode):
+        if episode is None or episode >= self.CURRICULUM_STAGE_2_END:
+            return 3
+        if episode < self.CURRICULUM_STAGE_1_END:
+            return 1
+        return 2
 
     def get_action_mask(self):
         """No action masking (paper-faithful). Kept for API compatibility."""

@@ -15,12 +15,14 @@ from environment import WVRCombatEnv
 from agent import QRDQNAgent
 
 
-# --- Undocumented patch #4: n-step returns ---
+# --- Undocumented patch: n-step returns ---
 # With gamma=0.9 and 1200-step episodes, terminal +/-1 decays to ~0 by 25
-# steps and is invisible at episode start. n-step returns propagate the
-# terminal reward back n steps per training update, which is essential for
-# learning the final crash-induction maneuver from the win signal.
-N_STEP = 10
+# steps and is invisible at episode start. n-step propagates the terminal
+# back n steps per training update. n=20 covers the full descent+level-out
+# maneuver length (~30-50 steps including the dive sequence), where n=10
+# only covers the very last leveling. Tradeoff: variance grows with n, but
+# for sparse-terminal-reward problems the bias reduction dominates.
+N_STEP = 20
 
 
 class NStepBuffer:
@@ -76,6 +78,8 @@ def evaluate(agent, env, n_games=500):
     wb = sum(1 for r in results if r == 'win_blood' or r == 'win_timeout')
     lc = sum(1 for r in results if r == 'lose_crash')
     lb = sum(1 for r in results if r == 'lose_blood' or r == 'lose_timeout')
+    dg = sum(1 for r in results if r == 'lose_disengaged')
+    ne = sum(1 for r in results if r == 'lose_timeout_no_engagement')
     dr = sum(1 for r in results if 'draw' in r)
 
     wins = wc + wb
@@ -85,7 +89,7 @@ def evaluate(agent, env, n_games=500):
         'win_rate': wr * 100,
         'ci_low': max(0.0, wr - 1.96 * se) * 100,
         'ci_high': min(1.0, wr + 1.96 * se) * 100,
-        'wc': wc, 'wb': wb, 'lc': lc, 'lb': lb, 'draws': dr,
+        'wc': wc, 'wb': wb, 'lc': lc, 'lb': lb, 'dg': dg, 'ne': ne, 'draws': dr,
         'total': n_games,
     }
 
@@ -109,6 +113,8 @@ def train(num_episodes=100000, seed=42, eval_every=5000, eval_games=500):
     print(f"Constrained-RL: hard ceiling at {env.red.CEILING_ALT:.0f}m, "
           f"disengage>{env.DISENGAGE_DIST:.0f}m -> -1, "
           f"timeout w/both>{env.NO_ENGAGE_HEALTH:.0f}HP -> -1")
+    print(f"Curriculum: Stage1 < {env.CURRICULUM_STAGE_1_END} (close+low), "
+          f"Stage2 < {env.CURRICULUM_STAGE_2_END} (mix), Stage3 (paper)")
     print(f"Undocumented patches: reward scale x{env.REWARD_SCALE}, "
           f"enemy 10x10ms substeps")
     print(f"Dynamics: paper Eq. 1 gravity-coupled, {env.red.N_SUBSTEPS} substeps/decision")
@@ -160,8 +166,9 @@ def train(num_episodes=100000, seed=42, eval_every=5000, eval_games=500):
             wb = sum(1 for r in rc if r == 'win_blood' or r == 'win_timeout')
             lc = sum(1 for r in rc if r == 'lose_crash')
             lb = sum(1 for r in rc if r == 'lose_blood' or r == 'lose_timeout')
+            dg = sum(1 for r in rc if r == 'lose_disengaged')
+            ne = sum(1 for r in rc if r == 'lose_timeout_no_engagement')
             dr = sum(1 for r in rc if 'draw' in r)
-            to = sum(1 for r in rc if 'timeout' in r)
             wr = (wc + wb) / len(rc) * 100
             al = np.mean(losses[-2000:]) if losses else 0
             ra = np.mean(end_data['ra'][-200:])
@@ -176,8 +183,9 @@ def train(num_episodes=100000, seed=42, eval_every=5000, eval_games=500):
             avg_eps_per_sec = ep / total_elapsed if total_elapsed > 0 else eps_per_sec
             eta_seconds = (num_episodes - ep) / avg_eps_per_sec if avg_eps_per_sec > 0 else 0
 
-            print(f"Ep {ep:6d} | "
-                  f"WC:{wc:3d} WB:{wb:2d} LC:{lc:3d} LB:{lb:2d} TO:{to:3d} D:{dr:2d} | "
+            stage = env._curriculum_stage(ep)
+            print(f"Ep {ep:6d} S{stage} | "
+                  f"WC:{wc:3d} WB:{wb:2d} LC:{lc:3d} LB:{lb:3d} DG:{dg:3d} NE:{ne:3d} D:{dr:2d} | "
                   f"WR:{wr:5.1f}% | Loss:{al:.4f} | Eps:{agent.epsilon():.2f} | "
                   f"RA:{ra:6.0f} BA:{ba:6.0f} | RH:{rh:5.1f} BH:{bh:5.1f} | "
                   f"Time: {timedelta(seconds=int(total_elapsed))} ({eps_per_sec:.1f} ep/s) | "
